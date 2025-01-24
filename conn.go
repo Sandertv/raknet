@@ -483,6 +483,9 @@ func resolve(addr net.Addr) netip.AddrPort {
 	if udpAddr, ok := addr.(*net.UDPAddr); ok {
 		uaddr := *udpAddr
 		ip, _ := netip.AddrFromSlice(uaddr.IP)
+		if ip.Is4In6() {
+			ip = ip.Unmap()
+		}
 		return netip.AddrPortFrom(ip, uint16(uaddr.Port))
 	}
 	return netip.AddrPort{}
