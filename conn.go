@@ -2,6 +2,7 @@ package raknet
 
 import (
 	"bytes"
+	"context"
 	"encoding"
 	"errors"
 	"fmt"
@@ -37,12 +38,15 @@ type Conn struct {
 
 	closing atomic.Int64
 
+	ctx        context.Context
+	cancelFunc context.CancelFunc
+
 	conn    net.PacketConn
 	raddr   net.Addr
 	handler connectionHandler
 
-	once              sync.Once
-	closed, connected chan struct{}
+	once      sync.Once
+	connected chan struct{}
 
 	mu  sync.Mutex
 	buf *bytes.Buffer
@@ -99,7 +103,6 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		mtu:            mtu,
 		handler:        h,
 		pk:             new(packet),
-		closed:         make(chan struct{}),
 		connected:      make(chan struct{}),
 		packets:        internal.Chan[[]byte](4, 4096),
 		splits:         make(map[uint16][][]byte),
@@ -110,6 +113,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
 		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
 	}
+	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
 	t := time.Now()
 	c.lastActivity.Store(&t)
 	go c.startTicking()
@@ -167,7 +171,7 @@ func (conn *Conn) startTicking() {
 				}
 				conn.mu.Unlock()
 			}
-		case <-conn.closed:
+		case <-conn.ctx.Done():
 			return
 		}
 	}
@@ -218,7 +222,7 @@ func (conn *Conn) checkResend(now time.Time) {
 // simultaneously from multiple goroutines, but will write one by one.
 func (conn *Conn) Write(b []byte) (n int, err error) {
 	select {
-	case <-conn.closed:
+	case <-conn.ctx.Done():
 		return 0, conn.error(net.ErrClosed, "write")
 	default:
 		conn.mu.Lock()
@@ -274,7 +278,7 @@ func (conn *Conn) write(b []byte) (n int, err error) {
 // Read blocks until a packet is received over the connection, or until the
 // session is closed or the read times out, in which case an error is returned.
 func (conn *Conn) Read(b []byte) (n int, err error) {
-	pk, ok := conn.packets.Recv(conn.closed)
+	pk, ok := conn.packets.Recv(conn.ctx)
 	if !ok {
 		return 0, conn.error(net.ErrClosed, "read")
 	} else if len(b) < len(pk) {
@@ -287,7 +291,7 @@ func (conn *Conn) Read(b []byte) (n int, err error) {
 // blocks until a packet is received over the connection, or until the session
 // is closed or the read times out, in which case an error is returned.
 func (conn *Conn) ReadPacket() (b []byte, err error) {
-	pk, ok := conn.packets.Recv(conn.closed)
+	pk, ok := conn.packets.Recv(conn.ctx)
 	if !ok {
 		return nil, conn.error(net.ErrClosed, "read")
 	}
@@ -302,13 +306,20 @@ func (conn *Conn) Close() error {
 	return nil
 }
 
+// Context returns the connection's context. The context is canceled when
+// the connection is closed, allowing for cancellation of operations
+// that are tied to the lifecycle of the connection.
+func (conn *Conn) Context() context.Context {
+	return conn.ctx
+}
+
 // closeImmediately sends a Disconnect notification to the other end of the
 // connection and closes the underlying UDP connection immediately.
 func (conn *Conn) closeImmediately() {
 	conn.once.Do(func() {
 		_, _ = conn.Write([]byte{message.IDDisconnectNotification})
 		conn.handler.close(conn)
-		close(conn.closed)
+		conn.cancelFunc()
 
 		conn.mu.Lock()
 		defer conn.mu.Unlock()

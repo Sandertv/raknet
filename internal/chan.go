@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 )
@@ -23,14 +24,14 @@ func Chan[T any](size, max int) *ElasticChan[T] {
 	return c
 }
 
-// Recv attempts to read a value from the channel. If cancel is closed, Recv
+// Recv attempts to read a value from the channel. If ctx is canceled, Recv
 // will return ok = false.
-func (c *ElasticChan[T]) Recv(cancel <-chan struct{}) (val T, ok bool) {
+func (c *ElasticChan[T]) Recv(ctx context.Context) (val T, ok bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	select {
-	case <-cancel:
+	case <-ctx.Done():
 		return val, false
 	case val = <-c.ch:
 		if c.len.Add(-1) < 0 {
